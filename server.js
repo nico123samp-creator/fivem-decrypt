@@ -225,6 +225,44 @@ function deobfLua(src) {
   return c;
 }
 
+// ─── Keymaster API download (server-side decrypt by CFX) ─────────────────────
+async function tryKeymasterDownload(jwtToken, resId, log) {
+  const https = require('https');
+  const endpoints = [
+    `https://keymaster.fivem.net/api/resource/${resId}/archive`,
+    `https://keymaster.fivem.net/api/assetsystem/resource/${resId}/versions/latest/archive`,
+    `https://runtime.fivem.net/policy/resource/${resId}`,
+  ];
+  for (const url of endpoints) {
+    try {
+      log(`Mencoba keymaster: ${url}`);
+      const buf = await new Promise((resolve, reject) => {
+        const req = https.get(url, {
+          headers: {
+            'Authorization': `Bearer ${jwtToken}`,
+            'User-Agent': 'CitizenFX/6 (FXServer)',
+            'Accept': 'application/zip, application/octet-stream',
+          },
+          timeout: 15000,
+        }, res => {
+          if (res.statusCode === 401 || res.statusCode === 403) return reject(new Error(`HTTP ${res.statusCode}`));
+          if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      });
+      if (buf.length > 100) {
+        log(`Keymaster: dapat ${(buf.length/1024).toFixed(1)} KB dari ${url}`);
+        return buf;
+      }
+    } catch (e) { log(`Keymaster ${url}: ${e.message}`); }
+  }
+  return null;
+}
+
 // ─── Main endpoint ─────────────────────────────────────────────────────────────
 app.post('/decrypt', upload.fields([{ name: 'zip' }, { name: 'grant' }]), async (req, res) => {
   const logs = [];
@@ -260,6 +298,27 @@ app.post('/decrypt', upload.fields([{ name: 'zip' }, { name: 'grant' }]), async 
       if (!resId) { const lm = mt.match(/fivem-releases\.com\/[^/]+\/(\d+)/); if (lm) resId = lm[1]; }
     }
     log(`Resource: ${resName || '(unknown)'}${resId ? ` (ID: ${resId})` : ''}`);
+
+    // ── Try keymaster server-side download first ──────────────────────────────
+    if (isJWT && resId && grantBuf) {
+      const rawJWT = grantBuf.toString('utf8').trim();
+      log(`Mencoba download langsung dari keymaster (resource ID: ${resId})...`);
+      const kmBuf = await tryKeymasterDownload(rawJWT, resId, log);
+      if (kmBuf) {
+        // Check if it's a valid ZIP
+        try {
+          await JSZip.loadAsync(kmBuf);
+          log('Keymaster berhasil — ZIP ter-decrypt diterima');
+          const outName = path.basename(req.files.zip[0].originalname, '.zip') + '_km_decrypted.zip';
+          res.set({
+            'Content-Type': 'application/zip',
+            'Content-Disposition': `attachment; filename="${outName}"`,
+            'X-Decrypt-Log': logs.slice(-10).join(' | '),
+          });
+          return res.send(kmBuf);
+        } catch { log('Keymaster: response bukan ZIP valid, lanjut decrypt lokal'); }
+      }
+    }
 
     // Resolve key
     let keyBuf = null;
